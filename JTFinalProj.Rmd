@@ -1,0 +1,763 @@
+---
+title: "STA 141A:  Predicting Wildfire Incidence in the United States"
+author:  "Josiah Tolbert"
+date: "March 16, 2026"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    theme: flatly
+    
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+set.seed(1738)
+library(tidyverse)
+library(lubridate)
+library(dplyr)
+library(ggplot2)
+library(cluster)
+library(patchwork)
+library(maps)
+library(usmap)
+library(gtsummary)
+library(sf)
+library(xgboost)
+library(pROC)
+library(kableExtra)
+library(slider)
+
+wf <- read.csv("wildfires_sample_100k.csv")
+```
+
+---
+
+# Abstract
+
+Wildfires across the United States pose an extended threat to livestock, human infrastructure, and safety to the general population. Wildfires are often unpredictable large-scale natural disasters that displace millions from their homes every year with little to no warning. 
+
+Being able to predict *when* and *where* these wildfires may breakout is imperative to thwarting this concerning wildfire outbreak issue. This project developed a **binary classification system** using notable wildfire outbreaks in historical U.S wildfire dataset sourced from **a subset of the 188 million US wildfires historical records**. By evaluating spatial, temporal, and historical data the predictor model was sought out to be able to predict when and where a wildfire may outbreak. 
+
+An **XGBoost model** was implemented against a baseline logistic regression model both using the predictors of latitude, longitude, and month of the fire outbreak. Additional historical information was added including a 12 month rolling size history and 3 month rolling siz count as to avoid data leakage. The model consistently outperformed the baseline model confirms the importance of these predictors.
+
+### Abstract: Key Insights
+
+* 100k Wildfire data sourced from *a subset of the 188 million US wildfires historical records*
+* Data cleaned and pre-processed to remove irrelevant columns
+* **Latitude and Longitude** used to create spatial grids for geographic data
+* Date column used to form **Discovery Month** Column for temporal data
+* Binary outcome column **'y_next'** created per spatial temporal grid cell (1 degree grid per month/year with 'floor()')
+* Implemented XGBoost model which outperformed baseline model analysis
+* Expanding-window cross validation ensures no temporal data leakage in 20 total annual folds
+* Geographic **Longitude** and **Latitude** data revealed to be the strongest predictor with spatial months and historical second in 2nd and third in terms of improtance..
+
+---
+
+# 1. Data Preprocessing
+
+## 1.1: Handling edge cases, missing information, and selecting predictors
+
+```{R, echo = FALSE}
+showNA <- wf %>%
+  summarise(across(everything(), list(
+    count_na = ~sum(is.na(.)),
+    perc_na = ~mean(is.na(.)) * 100,
+    count_blank = ~sum(. == "" | . == " ", na.rm = TRUE),
+    perc_blank = ~mean(. == "" | . == " ", na.rm = TRUE) * 100
+  ))) %>%
+  pivot_longer(everything(),
+               names_to = c("Column", ".value"),
+               names_pattern = "(.*)_(count_.*|perc_.*)") %>%
+  filter(count_na > 100 | count_blank > 100) %>%
+  mutate(total_perc = perc_na + perc_blank) %>%
+  arrange(desc(total_perc))
+
+#Put calculated info into a GGPlot for stronger visual
+
+ggplot(showNA, aes(x = reorder(Column, total_perc), y = total_perc, fill = total_perc)) +
+  geom_col(show.legend = FALSE) +
+  geom_text(aes(label = paste0(round(total_perc, 1), "%")), hjust = -0.1, size = 3) +
+  coord_flip() +
+  scale_fill_viridis_c(option = "magma", direction = -1) +
+  scale_y_continuous(limits = c(0, 115), labels = function(x) paste0(x, "%")) +
+  labs(
+    title = "Columns with Significant Missing or Blank Data",
+    x = NULL,
+    y = "Total Missing (%)",
+    caption = "Figure 1: Combined missing and blank rate per column (columns with > 100 missing/blank values shown)"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.y = element_text(size = 9),
+    plot.caption = element_text(face = "italic")
+  )
+```
+
+
+
+The thorough analysis began with a hearty summarize function and corresponding figure (*Figure 1*) pictured above. Of the 39 columns in the original dataset only 16 had Missing, blank, or unusual "0" responses - These can be located in Figure 1 above under the "Variable" column.
+
+Within these 16 missing columns **'COMPLEX_NAME', 'MTBS_FIRE_NAME', and 'ICS_209_NAME'**, all featured over a **98.5%** missing data rate and would largely be unreliable for use in further analysis. With the 36 left there was a systematic approach to determining which columns could formally stay. 
+ 
+<details>
+<summary>**Click to expand: Column Removal Detail Table**</summary>
+
+Of the 39 total columns *Figure 1* above isolates the variables with significant quality concerns namely 'COMPLEX_NAME','MTBS_FIRE_NAME', and 'ICS_209_NAME' all exceed 98.5% missing rates and are thus unusable. The 'COUNTY' Column is missing nearly 1/3 of it's total data  making it unusable as a spatial predictor. These predictors were removed on three major basis depending on an issue with future modeling. For this reason 'LATITUDE' and 'LONGITUDE' were selected as the preliminary spatial units as they are not missing a notable amount of data.
+
+1. **Data leakage**: Columns that had variables that were recorded after a fire breaks out, these cannot be used as predictors to prevent the model from cheating
+  *(e.g, 'FIRE_SIZE_CLASS','STAT_CAUSE_CODE','CONT_TIME')*
+
+2. **Multicolinearity**: With **'LATITUDE'** and '**LONGITUDE**' Being selected as the primary spatial units, other overlapping geographic coordinates were removed to prevent the model from overfitting on known data.
+  *(e.g, 'OWNER_CODE','COUNTY','FIPS_NAME')*
+
+3. **Administrative identifiers**: These were columns with predictive value as they are traditionally randomly assigned and only for high level fire administrative work
+  *(e.g, 'FPA_ID','FIRE_NAME','MTBS_ID')*
+
+</details>
+
+This confirms the heavy amount of data preprocessing necessary to have accurate and relevant data in our analysis.
+
+## 1.2: Filtering the dataset for large wildfires
+
+Every fire that was smaller than 300 acres in size was removed The 300 acres benchmark is used as **300 acres is consistent with the United States Operational Fire Management for large wildfire in grass or bush fuel models**. This largely helped to handle any remaining fire cases that may not have been properly filtered out by the thorough removal demonstrated above. The output and before and after the wildfire is as follows.
+
+```{r, echo = FALSE, results = 'hide'}
+
+
+wfclean <- wf %>%
+  distinct() %>%
+  drop_na(LATITUDE, LONGITUDE, FIRE_YEAR, DISCOVERY_DOY) %>%
+  # Preemptive Created longitude latitude coord grids for next step
+  mutate(
+    
+    lat_bin = floor(LATITUDE),
+    lon_bin = round(LONGITUDE),
+    
+    #Properly format date to retrieve month
+    dateclean = as.Date(paste(FIRE_YEAR, DISCOVERY_DOY, sep="-"), format = "%Y-%j"),
+    DISCOVERY_MONTH = as.numeric(format(dateclean, "%m")),
+    STATE = as.factor(STATE)
+  )
+
+# Filter to 300
+wfg <- wfclean %>%
+  filter(FIRE_SIZE >= 300)
+
+nrow(wf)
+nrow(wfg)
+```
+
+Prior to the filtering of smaller fires the dataset contained `r nrow(wf)` wildfires. After filter for fires strictly larger than **300 acres** the dataset dropped to `r nrow(wfg)` fires remaining. This presents itself as a massive drop in **97.29%** of all wildfires greatly  increasing the odds of a class imbalance issue as a true fire instance is now incredibly rare across our spatial temporal grids. `r nrow(wfg)` remaining fires is entirely possible as the scope of a 300 acre size fire is few and far between and is not a common occurrence. This confirms that many of those removed fires were simple sparks or short wild flames that were quickly stamped out and would lead to over fitting in the predictor model.
+
+## 1.3: Constructing space-time units, predictors, and the binary outcome.
+
+```{R, echo = FALSE, results = 'hide'}
+
+wfg <- wfg %>%
+  mutate(ym = FIRE_YEAR * 100 + DISCOVERY_MONTH) #Create ykey to easily groupby for special grids.
+
+#Sum up all fires for future predictors by month and in totality.
+firesum <- wfg %>%
+  group_by(lat_bin, lon_bin, ym) %>%
+  summarise(fire_count = n(),
+           fire_this_month = as.integer(n()>0),
+           .groups = "drop"
+  )
+
+
+
+# Make the frame for the latitude and longitude
+spatialdf <- firesum %>%
+  distinct(lat_bin, lon_bin)
+
+# Make the frame match with time
+temporaldf <- expand_grid(
+  FIRE_YEAR = min(wfclean$FIRE_YEAR):max(wfclean$FIRE_YEAR),
+  DISCOVERY_MONTH = 1:12
+) %>%
+  mutate(ym = FIRE_YEAR * 100 + DISCOVERY_MONTH)
+
+spacetime <- cross_join(spatialdf, temporaldf)
+
+
+# Merge the fire summary data into the spacetime matrix
+wfr <- spacetime %>%
+  left_join(firesum, by = c("lat_bin", "lon_bin", "ym")) %>%
+  mutate(
+    fire_count = coalesce(fire_count, 0L),
+    fire_this_month = coalesce(fire_this_month, 0L)
+  )
+wfr <- wfr %>%
+  arrange(lat_bin, lon_bin, ym) %>%
+  group_by(lat_bin, lon_bin) %>%
+  mutate(
+    y_next = lead(fire_this_month, n = 1L)
+  ) %>%
+  ungroup()%>%
+  filter(!is.na(y_next))
+  
+# Form the State predictor/easy measure
+
+modelstate <- function(x){
+  ux <- unique(x)
+  ux[which.max(tabulate(match(x, ux)))]
+}
+
+# Make the grid
+gridstate <- wfg %>%
+  group_by(lon_bin, lat_bin) %>%
+  summarise(state = modelstate(STATE), .groups = "drop")
+
+wfr <- wfr %>%
+  left_join(gridstate, by= c("lat_bin", "lon_bin"))
+
+wfr <- wfr %>%
+  mutate(
+    month_sin = sin(2*pi*DISCOVERY_MONTH/12),
+    month_cos = cos(2*pi*DISCOVERY_MONTH/12)
+  )
+
+
+#lagged fire-history predictors created to match baseline model
+gridfire <- wfg %>%
+  group_by(lat_bin, lon_bin, ym) %>%
+  summarise(fire_size = mean(FIRE_SIZE), .groups = "drop")
+
+wfr <- wfr %>%
+  left_join(gridfire, by = c("lat_bin", "lon_bin", "ym")) %>%
+  mutate(fire_size = coalesce(fire_size, 0))
+
+wfr <- wfr %>%
+  arrange(lat_bin, lon_bin, ym) %>%
+  group_by(lat_bin, lon_bin) %>%
+  mutate(
+    fire_roll12 = slide_sum(fire_count, before = 12, after = -1, complete = FALSE),
+    fire_roll3 = slide_sum(fire_count, before = 3, after = -1, complete = FALSE),  # Interpret bonuses for future non baseline predictive models
+    size_roll12 = slide_sum(fire_size, before = 12, after = -1, complete = FALSE)
+  ) %>%
+  ungroup()
+
+
+wfr <- wfr %>%
+  mutate(across(c(fire_roll12, fire_roll3, size_roll12),
+                ~coalesce(., 0)))
+
+mswfr <- nrow(wfr)
+
+
+
+```
+*Slide_sum methodology adopted from STA 141 Discussion for identical Baseline model^[2]^*
+
+
+
+**Spatial Grid:**Creating the **spatial temporal** matrix required the creation of **two unique dataframes**. The first half was the spatial side with **longitude** and **latitude** rounded to the first degree to create 1x1 degree latitude longitude grid cells with the `floor()` feature. This gave us **`r nrow(spatialdf)`** unique grid cells that have recorded at least 1 notable fire.
+
+**Temporal grid:** For the temporal half the max and min years (1992 - 2015) was calculated from the dataset and **'Discovery DOY'**  was used in conjunction with **'FIRE_YEAR'** and conversion to date formatting to properly retrieve the specific month out of the year. Then the sin and cos of each month was formed to ensure that the model can recognize that while December and Janaury are 11 units a part they are truly bordering months. 
+
+**Temporal Spatial Grid:** Using both created temporary data frames the `cross_join()` function was used to take the **Cartesian product** of the temporal and spatial grid to get **`r nrow(wfr)`** unique spatial grids derived from the latitude and longitude data.
+
+**Additional Predictors**: Additional predictors regarding the rolling count and size counts of 3, and 12 were created to form rolling memory to prevent future data leakage. The data is able to see the most recent data leading up to a month to make a new predictor on status of a fire given recent previous fires. Size_roll12 accounts for the size of wildfires over the last year, while Fire_roll 12 and 3 account for the *amount* of fire over the last 12 and 3 months respectively. An after = -1 was created to prevent immediate leakage.
+
+In this manner the main predictors were  formally constructed with discovery month being formed through the temporal analysis and construction  while **longitude** and **latitude** were formed by the spatial construction.
+
+**Binary outcome `y_next`**: For each grid cell, month `y_next = 1` if at least one notable wildfire occurs in that grid cell during the follow month, if not it receives a 0 for no. The `lead()` function is created to avoid the same month data leakage issue.
+
+
+```{r, echo = FALSE, results = 'hide'}
+totaldata <- nrow(wfr)
+nofire <- sum(wfr$y_next== 0) 
+yofire <- sum(wfr$y_next == 1) 
+
+nofirestat <- round((nofire/totaldata)*100 , digits = 3)
+firestat <-  round((yofire/totaldata)*100, digits = 3)
+
+paste("The percentage of fires in the dataset of roughly 984000 is", firestat, "percent")
+```
+
+ The created **binary check system** with the outcome percentage being `r firestat`%. Only `r yofire` out of `r totaldata` observations have a fire in the next month of their occurrence. This confirms the extreme class imbalance suggested in section 1.2. This confirms that a model such as **XGBoost** may be necessary to prevent false negative with the `scale_pos_weight` parameter to avoid always predicting "no fire"
+
+## 1.4: Data Preprocessing Summary
+
+
+```{r, echo = FALSE}
+predtable <- tibble(
+  predictor = c("lat_bin", "lon_bin", "month_sin", "month_cos", "fire_roll12", "state", "fire_roll3", "size_roll12"),
+  description = c(
+    "Grid latitude (1-degree floor bin)",
+    "Grid longitude (1-degree floor bin)",
+    "Cyclical sine of DISCOVERY_MONTH",
+    "Cyclical cosine of DISCOVERY_MONTH",
+    "Rolling fire count over past 12 months",
+    "Majority state for grid cell (Which state is this?)",
+    "rolling fire count over past 3 months",
+    "rolling total burn area over past 12 months"
+  ),
+  Used_In = c("Both","Both","Both","Both","Both","XGB","XGB","XGB")
+)
+
+knitr::kable(predtable,
+             caption = "Table 2: predictor variables and Model Assignment",
+             col.names = c("Predictor", "Description", "Used In")) %>%
+  kable_styling(bootstrap_option = c("striped", "hover", "condensed"), full_width = FALSE) %>%
+  row_spec(1:5, background = "lightblue") %>%
+  row_spec(6:8, background = "lightpink") %>%
+  footnote(general = "Blue rows = Baseline Model, pink = XGB booost")
+```
+
+Table 2 above focuses final table of all descriptive predictors, the first five light blue predictors will be featured in the strict BASELINE model while the pink predictors were specifically created to be used with the future XGBoost model. **Fire_roll3** captures short-term fire persistence, and **size_roll12** captures whether historically large burns evaluate a greater chance of another fire via burned ground.
+
+
+## 1.5 Total Data summary table
+
+| Feature | Description | Column(s)|
+| :--- | :--- | :--- |
+| **Total Size** | 984000 space-time units | **N/A** |
+| **spatial unit** |1x1 Decimal Degrees via floor bins to create grids | `lon_bin`,`lat_bin` |
+| **Temporal unit** | Month of discovery coded to sin & cos | `month_sin`, `month_cos` |
+| **Year Range** | 1992 - 2015 | **`FIRE_YEAR`** |
+| **Binary Outcome** | Whether a notable fire occurs in the grid cell next month | `y_next` |
+| **Predictors (BASE)** | `lat_bin`, `lon_bin`, `month_sin`, `month_cos`, `fire_roll12` | **N/A** |
+| **Predictors (XGB)** | All base + `state`, `fire_roll3`, `size_roll12`| **N/A** |
+
+*Table 3: Total metadata*
+
+Table 3 is the comprehensive summary of the model metadata, the range of year 1992-2015, and all predictors outlined once more for clarity. 
+---
+
+
+# 2. Exploratory Data Analysis  
+
+
+## 2.1 United States Heatmap 
+
+To visualize the Implications of potential fires by location (**Latitude and longitude**) grid was created using the United states map data to view by grid. A **U.S heatmap** was created to see the total expanse of ignition count by location to visualize any potential spatial patterns in the wildfires dataset
+```{r, echo = FALSE, warning = FALSE}
+#US Map data mapped on ignition by Longitude and Latitude 
+
+#Grab US State data
+
+fireMAP <- wfg %>%
+  group_by(lat_bin, lon_bin) %>%
+  summarise(fire_countr = n(), .groups = "drop")
+
+fireMAP <- fireMAP %>%
+  mutate(
+    lat = lat_bin + 0.5,
+    lon = lon_bin + 0.5
+  )
+
+# Use USmap transform to properly initialize coordinates for USMAP data
+
+# Usmap library is used as it puts Alaska and Hawaii in the graph with the main 48.
+
+firemapUS <- usmap_transform(fireMAP)
+
+plot_usmap("states", color = "white", fill = "gray") +
+  geom_sf(data = firemapUS,
+             aes( size = fire_countr, color = fire_countr),
+             alpha = 0.6) +
+  scale_color_viridis_c(option = "inferno", direction = -1) +
+  labs(
+    title = "Notable Wildfire Ignition (>= 300 acres) by spatial grid",
+    caption = "Figure 2: Spatial distribution of large United states wildfires",
+    color = "Total Fires",
+    size = "Total Fires"
+  ) +
+  theme(legend.position = "right",
+        plot.caption = element_text(face = "italic"))
+
+
+```
+*USMAP Referenced^[1]^*
+
+*Figure 2* reveals that while our table by spatial grid was correct in indicating a general trend towards the southwest part of the united states, the actual United States map reveals that there is a stronger trend towards the west of the united states in general with huge outlier points in **eastern Oklahoma**, **southern Florida**, and **eastern Kentucky**. To achieve the clarity on *Figure 2* a special **USmap library** was used in tandem with geom_sf to alleviate the visual issues with the standard map dataset. The `USmap` library correctly places **Alaska and Hawaii** in frame for ease of viewing as opposed to the forced spreading out with Alaska and Hawaii in their geographically correct positions. In totality this graph confirms that the north east is the least active wildfire zone with the propensity of a large ignition largely flowing a spread towards the south or west of the continental United states.Notable outliers reside in the dark red spots on the map such as **Florida, Kentucky, Oklahoma**, and **California**.
+
+Certain grids cells and states carry a much higher baseline risk than other states which we can assume are from locals and weather patterns of the surrounding area. 
+
+
+
+## 2.2 Temporal Fire probability - Seasonal
+```{r, echo = FALSE}
+fire_by_month <- wfr %>%
+  mutate(
+    tempfire = as.numeric(as.character(y_next)), 
+    fire_month = ifelse(DISCOVERY_MONTH == 12, 1, DISCOVERY_MONTH + 1)  # y_next fires happen NEXT month to , quick ESF to ensure december is not overlapped
+  ) %>%
+  group_by(fire_month) %>%
+  summarise(
+    fire_events = sum(tempfire),
+    .groups = "drop"
+  )
+
+ggplot(fire_by_month, aes(x = factor(fire_month), y = fire_events,
+                           fill = factor(fire_month))) +
+  geom_col(show.legend = FALSE) +
+  scale_fill_viridis_d(option = "turbo") +
+  geom_text(aes(label = fire_events), vjust = -0.5, size = 3.5) +
+  scale_x_discrete(labels = c("Jan","Feb","Mar","Apr","May","Jun",
+                               "Jul","Aug","Sep","Oct","Nov","Dec")) +
+  labs(
+    title = "Predicted Fire Events by Month of Occurrence",
+    subtitle = "Total (grid, month) observations where y_next = 1, shown by the month the fire occurs",
+    x = "Month Fire Occurs",
+    y = "Total Predicted Fire Events",
+    caption = "Figure 3: Y_next output was slightly modified to show a clearer image of the month the fire prediction is instead of thereafter "
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    plot.caption = element_text(face = "italic"))
+```
+
+*Figure 3* Shows a clear seasonal pattern with **June, July, and August** having a massive spike  that sharply declines in the fall winter. This leads to the seasonality of wildfires directly correlating with heat and temperature in the summer months compared to the wet and cold patterns found in the winter. This confirms that going with the cylindrical month encoding **month_sin, month_cos** rather than treating month as a raw number is directly responsible for helping the model learn as **December** and **January** are adjacent with close results. It better reflects the actual annual cycle.
+
+## 2.3 Annual trends + Notable states
+
+```{r, echo = FALSE}
+#Graph ignition per year amt, 
+
+Yearlog <- wfg %>%
+  group_by(FIRE_YEAR) %>%
+  summarise(Annual_fire = n(), .groups = "drop")
+
+B12 <- ggplot(data = Yearlog, aes(FIRE_YEAR, y = Annual_fire)) +
+  geom_line(color = "firebrick") +
+  geom_point(color = "black") +
+  labs(
+    title = "Line plot of total fires by year",
+    x = "Year",
+    y = "Amount of fires over 300 acres ",
+    caption = "Figure 4 left - Line Graph of amount of fire by year"
+  ) +
+  theme_minimal() +
+  scale_x_continuous(breaks = seq(1992, 2015, by = 4)) +
+  theme(
+    axis.text.x = element_text(angle =45, hjust = 1))
+
+  recordyears <- c( 2000, 2006, 2007, 2012)
+  
+  topstates <- wfg %>%
+    count(STATE, sort = TRUE) %>%
+    head(8) %>%
+    pull(STATE)
+  
+  
+  
+  recordstates <- wfg %>%
+    filter(STATE %in% topstates) %>%
+    droplevels() %>%
+    mutate(yeartype = ifelse(FIRE_YEAR %in% recordyears, "Breakout Years", "Other Years")) %>%
+    group_by(yeartype, STATE) %>%
+    summarise(fires = n(), .groups = "drop") %>%
+    group_by(yeartype) %>%
+    mutate(perc = fires/sum(fires)*100) %>%
+    ungroup() %>%
+  complete(yeartype, STATE, fill = list(fires = 0, perc = 0))
+  
+  G5 <- ggplot(recordstates, aes(x = reorder(STATE, perc), y = perc, fill = yeartype)) +
+    geom_col(position = "dodge", alpha = 0.85) +
+    coord_flip() +
+    scale_fill_manual(values = c("Breakout Years" = "firebrick", "Other Years" = "steelblue")) +
+    labs(
+      title = "top States: Breakout vs. Normal Years",
+      x = "State",
+      y = "% of Notable FIres",
+      fill = "",
+      caption = "Figure 4 right, cont - blue normal years, red breakout years"
+    ) +
+    theme_minimal() +
+    theme(legend.position = "bottom")
+    
+
+B12 + G5
+
+```
+Noted in *Figure 4 left* above, An additional graph regarding temporal year units was created to see if there was a large distance between fire years in the United States throughout the year range. The graph showed a **slight overall increase in amount of fire per year since 1992**.However, There were a few breakout years notably in **2000**, **2006**, **2007**, & **2012**. Upon further inspection noted in *Figure 4 right* the top 8 years in percentage of fires per year shows that the overall difference via state in breakout compared to regular year was mostly  at fault of **Indiana**, **Texas**, and **Montana** This suggests that the nationwide spikes are driven more so by localized surges in specific states rather than a uniform nation-level increase. For the `STATE` predictor seems of value to be used in modeling in section 3
+
+---
+
+# 3. Modeling
+
+## 3.1 Baseline Model
+
+The Baseline model was selected with the response variable as the binary "y_next" (whether a fire will happen next month) column defined in section 1 with the predictor variables being as follows: spatial coordinates (`lat_bin`, `lon_bin`), cyclical month encoding (`month_sin`, `month_cos`), and a 12-month rolling fire count (`fire_roll12`).
+
+
+Baseline Model prediction probability formula:
+$$
+p_i = P(y\_next_i = 1 \mid \mathbf{x}_i)
+$$
+Formal Baseline Model:
+
+$$
+\log\left(\frac{p_i}{1-p_i}\right) = \beta_0 + \beta_1 \cdot \text{lat.bin}_{i} + \beta_2 \cdot \text{lon.bin}_{i} + \beta_3 \cdot \text{month.cos}_{i} + \beta_4 \cdot \text{month.sin}_{i} + \beta_5 \cdot \text{fire.roll12}_{i}
+$$
+
+
+
+```{R, echo = FALSE, results = 'hide'}
+
+# Make the models together for brevity
+
+baseline_formula <- y_next ~ lat_bin + lon_bin + month_cos + month_sin + fire_roll12
+
+xgb_formula  <- y_next ~ lat_bin + lon_bin + month_cos + month_sin + fire_roll12 + state + fire_roll3 + size_roll12
+
+model_df <- wfr %>%
+  mutate(y_next = factor(y_next, levels = c(0,1))) %>%
+  select(y_next, lat_bin, lon_bin, state,
+         month_cos, month_sin, FIRE_YEAR,
+         fire_roll12, fire_roll3, size_roll12)
+```
+## 3.2 Model of Choice: XGboost
+
+The **XGboost model**(Extreme Gradient boosting) model is an ensemble learning method that builds sequential decision trees to minimize classifications errors. Unlike the standard logistic regression model the XGBoost model can capture **nonlinear relationships and interactions** between predictors such as the interaction specific a specific grid cell and recent fire history.
+
+
+As noted prior the logistic regression model is heavily susceptible to our data's extreme class imbalance when can also be offset with the `Scale_pos_weight()` function. In addition to this the XGBoost model will have 3 more predictors than the baseline being
+
+* **`state`** - captures state level policy such as vegetation, climate, policy, and urban density
+* **`fire_roll3`** - captures short-term fire cluster effect to see if a fire causes sequential fires
+* **`size_roll12`** - captures whether historically large burns evaluate future risk or dampen the risk of further flames by charring land.
+
+
+
+For our binary classification task, the model outputs a predicted probability $\hat{p}_i$ per instance i by summing up the prediction of the K (additive trees) and applying the logistic sigmoid :
+
+$$
+\hat{p}_i = \frac{1}{1 + e^{-\hat{y}_i}} \quad \text{where} \quad \hat{y}_i = \sum_{k=1}^K f_k(x_i), \quad f_k \in \mathcal{F}
+$$
+Here the $X_i$ represents our our full predicted vector set (spatial, seasonal, and all lagged behind fire history features) and $\mathcal{F}$ is the space of all possible decision trees. After doing so the model is able to minimize the the regularized objective:
+$$
+\text{Obj} = \sum_{i=1}^n L(y_i, \hat{p}_i) + \sum_{k=1}^K \Omega(f_k)
+$$
+Where $L(y_i, \hat{p}_i)$ is the log loss measuring the difference between the true fire occur $y_i$ and the predicted probability $\hat{p}_i$. $\Omega(f_k)$ is the regularization term mentioned earlier that penalize the tree for being complexity to prevent overfitting from the severe class imbalance.
+
+### 3.3 XGboost Training Schematic
+
+1. Initialization with base prediction (log odds of the class ratio)
+2. Iterative boosting: For $K = 1$ to 500  rounds:
+  a. Compute residuals (gradient of the loss)
+  b. Fit new decision tree to these residuals
+  c. Add this new tree to the model with learning rate of $n = 0.1$ selected to prevent overfitting
+3. Output: the final prediction is weighted sum of all 500 trees pass through the logistic function
+
+---
+
+# 4. Model Fitting and Validation
+
+## 4.1 Time-Aware Expanding window cross validation
+
+```{r, echo = FALSE, results = 'asis'}
+years_sorted <- sort(unique(model_df$FIRE_YEAR))
+min_train_years <- 3
+
+fold_results <- tibble(
+  train_end_year = years_sorted[(min_train_years):(length(years_sorted) - 2)],
+  valid_year     = years_sorted[(min_train_years + 1):(length(years_sorted) - 1)]
+) %>%
+  mutate(
+    auc_glm = map2_dbl(train_end_year, valid_year, function(tr_end, va_year) {
+      train <- model_df %>% filter(FIRE_YEAR <= tr_end)
+      valid <- model_df %>% filter(FIRE_YEAR == va_year)
+      fit <- glm(baseline_formula, data = train, family = "binomial")
+      p_hat <- predict(fit, newdata = valid, type = "response")
+      roc_obj <- roc(response = valid$y_next, predictor = p_hat, quiet = TRUE)
+      as.numeric(auc(roc_obj))
+    }),
+    auc_xgb = map2_dbl(train_end_year, valid_year, function(tr_end, va_year) {
+      train <- model_df %>% filter(FIRE_YEAR <= tr_end)
+      valid <- model_df %>% filter(FIRE_YEAR == va_year)
+      train_x <- model.matrix(xgb_formula, data = train)[, -1]
+      train_y <- as.numeric(as.character(train$y_next))
+      valid_x <- model.matrix(xgb_formula, data = valid)[, -1]
+      valid_y <- as.numeric(as.character(valid$y_next))
+      imbalance <- sum(train_y == 0) / max(sum(train_y == 1), 1) 
+      xgb_fit <- xgboost(
+        data = train_x, label = train_y,
+        max_depth = 6, eta = 0.1, nrounds = 500,       
+        objective = "binary:logistic",
+        scale_pos_weight = imbalance,
+        verbose = 0
+      )
+      p_hat <- predict(xgb_fit, newdata = valid_x)
+      roc_obj <- roc(response = valid_y, predictor = p_hat, quiet = TRUE)
+      as.numeric(auc(roc_obj))
+    })
+  )
+
+cat('<details><summary><strong>Click to expand: Full Fold by Fold AUC Results (Table 4)</strong></summary>\n\n')
+
+knitr::kable(fold_results,
+             caption = "Table 4: Expanding-Window Cross-Validation AUC Results",
+             col.names = c("Train Through", "Validate On", "Baseline AUC", "XGBoost AUC"),
+             digits = 3) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE) %>%
+  scroll_box(height = "350px") %>%
+  footnote(general = "Each fold trains on all data up to the listed year and validates on the next year.") %>%
+  print()
+
+cat('\n\n</details>\n')
+```
+*Expanding cross validation loosely based on R documentation from tidyverse ^[3]^*
+
+
+## 4.2 Expanding Window AUC Validation results and comparison
+
+```{R, echo = FALSE, message = FALSE, warning = FALSE}
+fold_long <- fold_results %>%
+  pivot_longer(
+    cols = c(auc_glm, auc_xgb),
+    names_to = "model",
+    values_to = "auc"
+  ) %>%
+  mutate(model = ifelse(model == "auc_glm", "Baseline (GLM)", "XGBoost"))
+
+ggplot(fold_long, aes(x = valid_year, y = auc, color = model)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  scale_color_manual(values = c("Baseline (GLM)" = "blue", "XGBoost" = "firebrick")) +
+  labs(
+    title = "time-aware Cross validation AUC by validation year",
+    x = "Validation_year",
+    y = "AUC",
+    color = "Model",
+    caption = "Figure 5: Expanding-window AUC comparison") +
+  theme_minimal() +
+  theme(plot.caption = element_text(face = "italic"))
+  
+```
+*Figure 5* Illustrates that the performance of the XGBoost is a robust and significant improvement over the baseline logistic regression model. For nearly every year the XGBoost model outperforms the Baseline model shifting the predictive power from roughly 0.75 overall to 0.83. an increase in 8 points for total probability of a true `y_next` fire outcome being marked higher than a non fire outcome. The XGBoost line consistently tracks above the baseline, confirming even before proper prediction that the additional predictors specified in section 3.2 all provide predictive value beyond the baseline model. The Year fluctuation mimics the status of real world fire affects as seen in *Figure 4 left*
+
+
+## 4.3 Tracking overall variable importance
+```{r, echo=FALSE}
+
+#Set up final training blocks
+
+final_train <- model_df %>% filter(FIRE_YEAR <= 2013)
+final_train_x <- model.matrix(xgb_formula, data = final_train)[, -1]
+final_train_y <- as.numeric(as.character(final_train$y_next))
+final_imbalance <- sum(final_train_y == 0)/ max(sum(final_train_y == 1), 1)
+
+
+
+#Run the largest train to test model to see variable importance
+
+xgb_final <- xgboost(
+  data = final_train_x,
+  label = final_train_y,
+  max_depth = 6,
+  eta = 0.1,
+  nrounds = 500,
+  objective = "binary:logistic",
+  scale_pos_weight = final_imbalance,
+  verbose = 0
+)
+
+impmat <- xgb.importance(feature = colnames(final_train_x), model = xgb_final)
+
+xgb.ggplot.importance(impmat, top_n = 15) +
+  labs(
+    title = "XGboost Model: Feature Importance graph",
+    caption = "Figure 6: Variable importance from the expanded XGboost model"
+  ) +
+  theme(plot.caption = element_text(face = "italic"))
+
+```
+
+*Figure 6* showcases the variance importance plot. Immediate insights are that the **Latitude and Longitude variables are incredibly vital to the variable importance and predictive ability of the XGboost model**. This is compounded on as the cylindrical month metrics are also heavily prevalent breaking into the >0.20 amounts. This confirms that these two features, **spatial and temporal**, are the two biggest factors to the predictive capabilities of the model. The added **Size_roll12** metric is also of note here being the 3rd highest non conjoined predictor greatly implying the size of fires burn is directly correlating to how likely a fire is to happen in the next month. State metrics appeared to be important to the models overall learning capability but not entirely relevant as only 1 state (Montana) surpassed another predictor (**fire_roll12**) in terms of predictability.
+
+Overall this graphs represents how spatial and temporal predictor are the most relevant to strengthening the model for classic predictors. In terms of rolling or lagged averages the size_roll12 or metric of total area burned is the strongest to be measured when gauging historical data.
+
+
+## 4.4 Training loss diagnostic
+
+
+```{R, echo = FALSE}
+
+ggplot(xgb_final$evaluation_log, aes(x = iter, y = train_logloss)) +
+  geom_line(color = "purple", linewidth = 1) +
+  theme_minimal() +
+  labs(
+    title = "XGboost model training loss over boosting Rounds",
+    x = "Number of Trees",
+    y = "Log Loss",
+    caption = "Figure 7: Diagnostic plot showing the reduction in training loss over time") +
+      theme(plot.caption = element_text(face = "italic"))
+  
+```
+
+Additionally the XGboost model seemingly circumvents the issue with **class imbalance** using the built in `scale_pos_weight` feature as it leads to a stronger model fitting by properly measuring the **class imbalance**. *Figure 7* has a clear deception of an initial spike as the model learns from the `scale_pos_weight` before continuing on a steady decline confirm that there was not an over correction issue in the final test
+
+
+## 4.5 Model performance summary
+
+```{r, echo = FALSE}
+avg_glm <- round(mean(fold_results$auc_glm), 3)
+avg_xgb <- round(mean(fold_results$auc_xgb), 3)
+improvement_pct <- round((avg_xgb /avg_glm) * 100 - 100, 2)
+auc_diff <- round(avg_xgb - avg_glm, 3)
+```
+
+| Model | Description | Predictors | Avg. CV AUC |
+| :--- | :--- | :--- | :--- |
+| **Baseline** | Logistic Regression (TA specification) | 5 | **`r avg_glm`** |
+| **XGBoost** | Gradient Boosted Trees (500 rounds) | 8 | **`r avg_xgb`** |
+*Table 5: Average AUC across all the expanding window folds*
+
+---
+
+*Table 5* Reveals that the XGboost model outperforms the baseline model by **`r auc_diff` AUC points**(**`r improvement_pct`%** relative improvement) averaged across all validations years. This demonstrates that the three additional predictors added to the model to show historical burn area, short term fire clustering, and state functionality were all meaningful to capture patterns and aid predictability to the XGBoost model.
+
+# 5. Summary
+
+## 5.1 Data preparation and filtering
+
+In summary, the goal to obtain a strong predictor model to determine wildfire occurrence in future months across land and time was a success. The raw dataset of **100,000** wildfire records was filtered to **`r nrow(wfg)`** notable fires (>= 300 acres). A 1 degree **spatial grid** was constructed an all grid cells that had ever recorded a fire in the year constraints of 1992 - 2015 were included. for a total of **`r nrow(wfr)`** observations. The binary outcome **`y_next`** was created to predict whether a fire occurs in the specific grid cell ** next month** avoiding the same month leakage issue. Eight total predictors were engineered across three specify groups: spatial (lat, lon, state), seasonal (cyclical month encoding), and lagged fire history (3-month and 12-month rolling counts and burn area) these were spliced between the two models.
+
+## 5.2 Exploratory Insights
+
+Wildfire occurrence is driven by both seasonality and **geopgraphy** as demonstrated in this report. The summer months of *June - August* show teh highest next-month fire probability while the geographic patterns show the **Midwest, west, and southwest** united states being the primary target for wildfires. Breakout fire years in the early to mid 2000s were examined by state to revealed that certain locals drive high risk areas to include, **Montana, Texas, and Indiana** supporting the need for `State` predictor column.
+
+## 5.3 Modeling Results
+
+**Final Results Table**
+
+| Model | Description | Test AUC Score | predictor amount |
+| :--- | :--- | :--- | :---|
+| **Baseline** | Logistic Regression | `r avg_glm` | 5 |
+| **XGBoost** | Advanced Gradiant Boost | `r avg_xgb` | 8 (Baseline + 3 new ) |
+
+*Table 6: Final Results AUC*
+
+The **XGboost** consistently outperformed the baseline logistic regression across the expanding window cross validation with  **~`r nrow(fold_results)` annual folds**. The improvement highlights th effectiveness of the XGboost model being able to draw interactions between complex predictors such as a cells **recent fire history, geographic locations, and current season**. Something the base logistic regression model is unable to do. Additionally Unlike a traditional Random Forest model it circumvents the massive RAM needed to account for nearly **a million possible entries** by mathematically sourcing the best. This surpassed the  base model cementing the **XGboost** model as the best for predicting future  wildfire outbreaks. 
+
+
+Finally the **variable importance plot** revealed that the strongest predictor was longitude with latitude with discovery month and previous fire size history following closely behind. This confirmed that while the **seasonal data** was important to predicting the mode, the spatial data had the strongest effect in determining if a fire outbreak would occur at any given point. Though the previous outbreak size history is strong enough to be relevant for **predictive analysis**.
+
+## 5.4 Final Summary
+
+* **Objective**: Predicted next-month notable wildfire occurrence across 1-degree spatial grid cells using historical U.S. wildfire data (1992–2015).
+
+* **Data Processing**: constructed a grid-by-month panel with 8 engineered predictors. All lagged features built from past data only to prevent temporal leakage. Extreme class imbalance handled via `scale_pos_weight`.
+
+* **Exploratory Data Analysis**: Revealed strong seasonal clustering (June–August peak) and geographic concentration (western/southwestern U.S.). Breakout year investigation showed state-level surges driving annual spikes.
+
+* **Modeling**: Baseline logistic regression uses the specific 5-predictor formula. XGBoost adds state, short-term fire count, and burn-area predictors to go beyond the baseline.
+
+* **Model Results**: XGboost model outperformed Logistic regression model by upwards of 4 total points for an average AUC of 0.72
+
+---
+
+# Reference 
+
+[1] Di Lorenzo, P. US maps *Including Alaska and Hawaii* R package and documentation https://usmap.dev
+
+[2] UC Davis STA 141 Discussion 9 & 10
+
+[3] R documentation from tidyverse purr documentation for large influence: https://purrr.tidyverse.org/reference/map2.html
